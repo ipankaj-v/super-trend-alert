@@ -13,7 +13,21 @@ use Illuminate\Support\Facades\Schedule;
 //     ->withoutOverlapping()
 //     ->appendOutputTo(storage_path('logs/supertrend.log'));
 
-    Schedule::command('supertrend:scan --resolution=15m --period=10 --factor=3 --source=mark')
+
+// Runs every minute. Timeframe, period, factor and price source come from .env
+// (SUPERTREND_RESOLUTION=1m|3m|5m|10m|15m ...), so changing timeframe needs no code edit.
+
+
+// Runs every minute. Timeframe, period, factor and price source come from .env
+// (SUPERTREND_RESOLUTION=1m|3m|5m|10m|15m ...), so changing timeframe needs no code edit.
+// The ?: fallbacks keep the scan working even if config/supertrend.php or the .env value is missing/empty.
+Schedule::command(sprintf(
+    'supertrend:scan --resolution=%s --period=%d --factor=%s --source=%s',
+    config('supertrend.resolution') ?: '15m',
+    config('supertrend.period') ?: 10,
+    config('supertrend.factor') ?: 3,
+    config('supertrend.source') ?: 'both',
+))
     ->everyMinute()
     ->withoutOverlapping()
     ->appendOutputTo(storage_path('logs/supertrend.log'));

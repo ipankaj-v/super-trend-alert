@@ -18,12 +18,13 @@
     </style>
 </head>
 <body>
-    <h2>BTC ATM CE / PE — Supertrend alerts</h2>
+    <h2>BTC CE / PE — Supertrend alerts</h2>
     <p><button id="enable">🔇 Click to enable sound</button> <small id="status"></small></p>
     <ul id="list">
         @foreach ($alerts as $a)
             <li class="{{ $a->type }}" data-id="{{ $a->id }}">
-                {{ $a->message }}<br><small>{{ $a->created_at->timezone('Asia/Kolkata')->format('d M H:i') }} IST</small>
+                {{ $a->message }}<br>
+                <small>{{ $a->candle_label }} · alert sent {{ $a->created_at->timezone('Asia/Kolkata')->format('H:i:s') }}</small>
             </li>
         @endforeach
     </ul>
@@ -58,10 +59,14 @@
     }
 
     const sounds = {
-        flip_green: () => beep([660, 880, 1100]),          // rising = bullish
-        flip_red: () => beep([1100, 880, 660]),            // falling = bearish
-        cycle_red_green_red: () => beep([1200, 600], 0.2, 3), // urgent
+        flip_green: () => beep([660, 880, 1100]),             // rising = bullish
+        flip_red: () => beep([1100, 880, 660]),               // falling = bearish
+        cycle_red_green_red: () => beep([1200, 600], 0.2, 3), // urgent: GREEN -> RED flip
     };
+
+    function esc(s) {
+        return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
 
     async function poll() {
         try {
@@ -72,7 +77,7 @@
                 lastId = Math.max(lastId, a.id);
                 const li = document.createElement('li');
                 li.className = a.type;
-                li.innerHTML = a.message + '<br><small>just now</small>';
+                li.innerHTML = esc(a.message) + '<br><small>' + esc(a.candle_label) + ' · alert sent just now</small>';
                 ul.prepend(li);
                 (sounds[a.type] || sounds.flip_green)();
                 if (Notification.permission === 'granted') new Notification('BTC Supertrend', { body: a.message });

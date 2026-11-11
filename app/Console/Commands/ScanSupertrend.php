@@ -10,8 +10,8 @@ use Illuminate\Console\Command;
 
 class ScanSupertrend extends Command
 {
-    protected $signature = 'supertrend:scan {--resolution=15m} {--period=10} {--factor=3} {--source=both : mark, traded or both}';
-    protected $description = 'Check BTC ATM CE/PE Supertrend flips on mark and/or traded price and store alerts';
+    protected $signature = 'supertrend:scan {--resolution=15m : 1m, 3m, 5m, 10m, 15m, 30m, 1h} {--period=10} {--factor=3} {--source=both : mark, traded or both}';
+    protected $description = 'Alert when BTC CE/PE Supertrend flips GREEN to RED on a closed candle (mark and/or traded price)';
 
     private int $candleSecs = 900;
     private string $res = '15m';
@@ -21,9 +21,14 @@ class ScanSupertrend extends Command
         $res = $this->option('resolution');
         $period = (int) $this->option('period');
         $factor = (float) $this->option('factor');
-        $candleSecs = ['1m' => 60, '3m' => 180, '5m' => 300, '15m' => 900, '30m' => 1800, '1h' => 3600][$res] ?? 900;
 
-        $this->candleSecs = $candleSecs;
+        if (! isset(DeltaClient::NATIVE[$res]) && ! isset(DeltaClient::DERIVED[$res])) {
+            $this->error("Unsupported resolution '{$res}'.");
+
+            return self::FAILURE;
+        }
+
+        $this->candleSecs = DeltaClient::seconds($res);
         $this->res = $res;
 
         $sources = match ($this->option('source')) {
@@ -33,11 +38,16 @@ class ScanSupertrend extends Command
         };
 
         $pick = $atm->resolve();
-        $this->info("[{$res}] Expiry {$pick['expiry']} | spot {$pick['spot']} | ATM {$pick['strike']}");
+        $this->info("[{$res}] Expiry {$pick['expiry']} | spot {$pick['spot']} | ATM {$pick['atm']} | mode {$pick['mode']} | CE {$pick['ce_strike']} | PE {$pick['pe_strike']} | alert on " . config('supertrend.alert_on', 'red'));
 
-        foreach (['CE' => $pick['call'], 'PE' => $pick['put']] as $side => $symbol) {
+        $targets = [
+            'CE' => [$pick['call'], $pick['ce_strike']],
+            'PE' => [$pick['put'], $pick['pe_strike']],
+        ];
+
+        foreach ($targets as $side => [$symbol, $strike]) {
             foreach ($sources as $source => $prefix) {
-                $this->scanOne($delta, $prefix . $symbol, $symbol, $side, $source, $pick['strike'], $res, $period, $factor);
+                $this->scanOne($delta, $prefix . $symbol, $symbol, $side, $source, $strike, $res, $period, $factor);
             }
         }
 
@@ -56,6 +66,7 @@ class ScanSupertrend extends Command
         $st = Supertrend::compute($candles, $period, $factor);
         if (count($st) < 3) {
             $this->warn("{$feed}: not enough closed candles (" . count($candles) . '), skipping.');
+
             return;
         }
 
@@ -66,46 +77,67 @@ class ScanSupertrend extends Command
             }
         }
 
-        foreach (array_slice($flips, -2) as $flip) {
-            $isLast = $flip === end($flips);
-            $type = $flip['to'] === 'green' ? 'flip_green' : 'flip_red';
-            $this->raise($symbol, $side, $source, $strike, $type, $flip);
+        // red = only GREEN->RED flips (default) | green = only RED->GREEN | both
+        $alertOn = config('supertrend.alert_on', 'red');
 
-            // red -> green -> red complete
-            if ($isLast && $flip['to'] === 'red' && count($flips) >= 2 && $flips[count($flips) - 2]['to'] === 'green') {
-                $this->raise($symbol, $side, $source, $strike, 'cycle_red_green_red', $flip);
+        // Only the two most recent flips can be fresh.
+        for ($k = max(0, count($flips) - 2); $k < count($flips); $k++) {
+            $flip = $flips[$k];
+            $prev = $flips[$k - 1] ?? null;
+
+            if ($flip['to'] === 'red') {
+                if (in_array($alertOn, ['red', 'both'], true)) {
+                    // entry = close of the GREEN flip that this RED flip is reversing
+                    $entry = ($prev !== null && $prev['to'] === 'green') ? $prev['close'] : null;
+
+                    // type name kept for the dashboard colour/sound: GREEN->RED flip
+                    $this->raise($symbol, $side, $source, $strike, 'cycle_red_green_red', $flip, $entry);
+                }
+            } elseif (in_array($alertOn, ['green', 'both'], true)) {
+                $this->raise($symbol, $side, $source, $strike, 'flip_green', $flip);
             }
         }
     }
 
-    private function raise(string $symbol, string $side, string $source, float $strike, string $type, array $c): void
+    private function raise(string $symbol, string $side, string $source, float $strike, string $type, array $c, ?float $entry = null): void
     {
-        // Ignore flips older than ~4 candles so a first run doesn't dump history.
-        if (time() - $c['time'] > 4 * $this->candleSecs) {
+        // $c['time'] is the candle OPEN time; the flip is only confirmed when that candle CLOSES.
+        $closeTime = $c['time'] + $this->candleSecs;
+
+        // Alert only on a just-closed candle (small grace for scheduler delay). Older flips,
+        // e.g. on a strike we just switched to, are history and must not alert.
+        if (time() - $closeTime > (int) config('supertrend.grace_seconds', 180)) {
             return;
         }
 
-        $label = [
-            'flip_green' => 'turned GREEN',
-            'flip_red' => 'turned RED',
-            'cycle_red_green_red' => 'completed RED→GREEN→RED',
-        ][$type];
-
         $tag = strtoupper($source);
+        $price = round($c['close'], 1);
+        $head = "[{$this->res}][{$tag}] BTC {$side} {$strike}";
+
+        $message = match ($type) {
+            'flip_green' => "{$head} Supertrend turned GREEN @ {$price} | SL " . round($c['line'], 1) . ' (Supertrend line)',
+            default => "{$head} Supertrend flipped GREEN→RED @ {$price}"
+                . ($entry !== null
+                    ? ' | green-flip entry ' . round($entry, 1) . ' | P/L ' . sprintf('%+.1f', $c['close'] - $entry) . ' pts'
+                    : ''),
+        };
 
         $alert = SupertrendAlert::firstOrCreate(
-            ['symbol' => $symbol, 'candle_time' => $c['time'], 'type' => $type, 'source' => $source],
+            [
+                'symbol' => $symbol, 'candle_time' => $c['time'], 'type' => $type,
+                'source' => $source, 'resolution' => $this->res,
+            ],
             [
                 'side' => $side,
                 'strike' => $strike,
                 'price' => $c['close'],
                 'line' => $c['line'],
-                'message' => "[{$this->res}][{$tag}] BTC ATM {$side} {$strike} Supertrend {$label} @ " . round($c['close'], 1),
+                'message' => $message,
             ]
         );
 
         if ($alert->wasRecentlyCreated) {
-            $this->line("ALERT: {$alert->message}");
+            $this->line("ALERT: {$alert->message} | {$alert->candle_label}");
         }
     }
 }
