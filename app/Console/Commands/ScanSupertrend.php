@@ -3,9 +3,11 @@
 namespace App\Console\Commands;
 
 use App\Models\SupertrendAlert;
+use App\Models\TrackedPosition;
 use App\Services\AtmResolver;
 use App\Services\DeltaClient;
 use App\Services\Supertrend;
+use Carbon\Carbon;
 use Illuminate\Console\Command;
 
 class ScanSupertrend extends Command
@@ -37,6 +39,9 @@ class ScanSupertrend extends Command
             default  => ['mark' => 'MARK:', 'traded' => ''],
         };
 
+        // Tracked trades first: an SL must never be blocked by a problem picking the ATM strike.
+        $this->checkPositions($delta, $period, $factor);
+
         $pick = $atm->resolve();
         $this->info("[{$res}] Expiry {$pick['expiry']} | spot {$pick['spot']} | ATM {$pick['atm']} | mode {$pick['mode']} | CE {$pick['ce_strike']} | PE {$pick['pe_strike']} | alert on " . config('supertrend.alert_on', 'red'));
 
@@ -52,6 +57,82 @@ class ScanSupertrend extends Command
         }
 
         return self::SUCCESS;
+    }
+
+    /** Trades you are tracking from the dashboard: SL = Supertrend flips RED -> GREEN. */
+    private function checkPositions(DeltaClient $delta, int $period, float $factor): void
+    {
+        foreach (TrackedPosition::where('status', 'active')->get() as $p) {
+            try {
+                $this->checkPosition($delta, $p, $period, $factor);
+            } catch (\Throwable $e) {
+                $this->warn("{$p->symbol}: {$e->getMessage()}");
+            }
+        }
+    }
+
+    private function checkPosition(DeltaClient $delta, TrackedPosition $p, int $period, float $factor): void
+    {
+        // Daily options settle 17:30 IST on the expiry date.
+        $expiryAt = Carbon::createFromFormat('d-m-Y H:i', $p->expiry . ' 17:30', 'Asia/Kolkata');
+        if (Carbon::now('Asia/Kolkata')->greaterThan($expiryAt)) {
+            $p->update(['status' => 'expired']);
+
+            return;
+        }
+
+        $secs = DeltaClient::seconds($p->resolution);
+        $feed = ($p->source === 'mark' ? 'MARK:' : '') . $p->symbol;
+
+        $candles = $delta->candles($feed, $p->resolution, 150);
+        if ($candles && end($candles)['time'] + $secs > time()) {
+            array_pop($candles); // still-forming candle
+        }
+
+        $st = Supertrend::compute($candles, $period, $factor);
+        if (count($st) < 2) {
+            $this->warn("{$feed}: not enough closed candles, skipping.");
+
+            return;
+        }
+
+        $last = end($st);
+        $p->fill([
+            'last_dir' => $last['dir'],
+            'last_price' => $last['close'],
+            'last_line' => $last['line'],
+            'last_checked_at' => now(),
+        ]);
+
+        // First RED -> GREEN flip whose candle CLOSED after you entered the trade.
+        for ($i = 1; $i < count($st); $i++) {
+            $flippedToGreen = $st[$i]['dir'] === 'green' && $st[$i - 1]['dir'] === 'red';
+            if (! $flippedToGreen || $st[$i]['time'] + $secs <= $p->entry_at) {
+                continue;
+            }
+
+            $exit = $st[$i]['close'];
+            $entry = (float) $p->entry_price;
+            $strike = (float) $p->strike;
+            $message = sprintf(
+                '[%s][%s] SL HIT BTC %s %s Supertrend flipped RED→GREEN @ %s | entry %s | P/L (short) %+.1f pts',
+                $p->resolution, strtoupper($p->source), $p->side, $strike, round($exit, 1), round($entry, 1), $entry - $exit
+            );
+
+            $alert = SupertrendAlert::firstOrCreate(
+                [
+                    'symbol' => $p->symbol, 'candle_time' => $st[$i]['time'], 'type' => 'sl_hit',
+                    'source' => $p->source, 'resolution' => $p->resolution,
+                ],
+                ['side' => $p->side, 'strike' => $strike, 'price' => $exit, 'line' => $st[$i]['line'], 'message' => $message]
+            );
+
+            $p->fill(['status' => 'sl_hit', 'exit_price' => $exit, 'exit_at' => $st[$i]['time'] + $secs]);
+            $this->line("ALERT: {$alert->message} | {$alert->candle_label}");
+            break;
+        }
+
+        $p->save();
     }
 
     private function scanOne(DeltaClient $delta, string $feed, string $symbol, string $side, string $source, float $strike, string $res, int $period, float $factor): void
