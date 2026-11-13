@@ -501,11 +501,15 @@
         });
     });
 
+    let pollBusy = false;
     async function poll() {
+        if (pollBusy) return; // a slow request must not overlap the next one (it would add the same alert twice)
+        pollBusy = true;
         try {
             const items = await api(URLS.feed + '?after=' + lastId);
             for (const a of items) {
                 lastId = Math.max(lastId, a.id);
+                if (alertsById[a.id]) continue; // already on screen
                 $('list').prepend(addAlert(a, true));
                 (sounds[a.type] || sounds.flip_green)();
                 if ('Notification' in window && Notification.permission === 'granted') new Notification('BTC Supertrend', { body: a.message });
@@ -514,6 +518,8 @@
             $('status').textContent = 'checked ' + new Date().toLocaleTimeString('en-GB');
         } catch (e) {
             $('status').textContent = 'connection issue, retrying…';
+        } finally {
+            pollBusy = false;
         }
     }
 

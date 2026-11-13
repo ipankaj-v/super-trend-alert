@@ -31,3 +31,15 @@ Schedule::command(sprintf(
     ->everyMinute()
     ->withoutOverlapping()
     ->appendOutputTo(storage_path('logs/supertrend.log'));
+
+
+    // ---- add to the bottom of routes/console.php ----
+// Paper trading: runs every minute, right after the scan. Uses the same Supertrend settings.
+Schedule::command(sprintf(
+    'supertrend:paper --source=mark --wait=1 --period=%d --factor=%s',
+    config('supertrend.period') ?: 10,
+    config('supertrend.factor') ?: 3,
+))
+    ->everyMinute()
+    ->withoutOverlapping()
+    ->appendOutputTo(storage_path('logs/supertrend.log'));
