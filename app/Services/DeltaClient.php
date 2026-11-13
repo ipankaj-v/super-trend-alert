@@ -22,10 +22,40 @@ class DeltaClient
         '10m' => ['5m', 600],
     ];
 
+    /**
+     * Delta's clock minus this PC's clock, in seconds, learned from HTTP Date headers.
+     * A cached response carries an OLD Date, which can only make Delta look further behind than it is,
+     * so across all responses in a run the largest sample is the truest one.
+     */
+    private static ?int $skew = null;
+
     /** Candle length in seconds for any supported resolution. */
     public static function seconds(string $resolution): int
     {
         return self::NATIVE[$resolution] ?? (self::DERIVED[$resolution][1] ?? 900);
+    }
+
+    /** Current time according to Delta (unix seconds), corrected for this PC's clock error. */
+    public static function serverNow(): int
+    {
+        return time() + self::skew();
+    }
+
+    public static function skew(): int
+    {
+        return self::$skew ?? 0;
+    }
+
+    /** Record the Date header of a response as a clock sample (keeps the largest). */
+    public static function noteServerDate(?string $date): void
+    {
+        $ts = $date ? strtotime($date) : false;
+        if (! $ts) {
+            return;
+        }
+
+        $sample = $ts - time();
+        self::$skew = self::$skew === null ? $sample : max(self::$skew, $sample);
     }
 
     private function http()
@@ -36,14 +66,38 @@ class DeltaClient
             ->retry(3, 500);
     }
 
+    /** GET a path and learn the clock difference from the response's Date header. */
+    private function get(string $path, array $query = []): array
+    {
+        $response = $this->http()->get($path, $query)->throw();
+
+        self::noteServerDate($response->header('Date'));
+
+        return $response->json() ?? [];
+    }
+
+    /**
+     * One small call to learn how far this PC's clock is from Delta's. It asks for a candle range that
+     * changes every second, so the response cannot come from a cache (a cached one has a stale Date).
+     */
+    public function syncClock(): int
+    {
+        $now = time();
+        $this->get('/history/candles', [
+            'symbol' => 'BTCUSD', 'resolution' => '1m', 'start' => $now - 120, 'end' => $now,
+        ]);
+
+        return self::skew();
+    }
+
     /** All live BTC option tickers for one expiry (DD-MM-YYYY). */
     public function optionTickers(string $expiry): array
     {
-        $res = $this->http()->get('/tickers', [
+        $res = $this->get('/tickers', [
             'contract_types'           => 'call_options,put_options',
             'underlying_asset_symbols' => 'BTC',
             'expiry_date'              => $expiry,
-        ])->throw()->json();
+        ]);
 
         return $res['result'] ?? [];
     }
@@ -51,7 +105,7 @@ class DeltaClient
     /** BTC spot/index price, taken from the perpetual ticker. */
     public function btcSpot(): float
     {
-        $res = $this->http()->get('/tickers/BTCUSD')->throw()->json();
+        $res = $this->get('/tickers/BTCUSD');
         $t = $res['result'] ?? [];
         $price = $t['spot_price'] ?? $t['mark_price'] ?? $t['close'] ?? null;
 
@@ -81,15 +135,15 @@ class DeltaClient
     private function fetch(string $symbol, string $resolution, int $count): array
     {
         $secs = self::NATIVE[$resolution] ?? 900;
-        $end = time();
+        $end = self::serverNow();
         $start = $end - ($secs * $count);
 
-        $res = $this->http()->get('/history/candles', [
+        $res = $this->get('/history/candles', [
             'symbol'     => $symbol,
             'resolution' => $resolution,
             'start'      => $start,
             'end'        => $end,
-        ])->throw()->json();
+        ]);
 
         $rows = $res['result'] ?? [];
         usort($rows, fn ($a, $b) => $a['time'] <=> $b['time']);

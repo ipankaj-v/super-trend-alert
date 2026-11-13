@@ -15,8 +15,12 @@ class ScanSupertrend extends Command
     protected $signature = 'supertrend:scan {--resolution=15m : 1m, 3m, 5m, 10m, 15m, 30m, 1h} {--period=10} {--factor=3} {--source=both : mark, traded or both}';
     protected $description = 'Alert when BTC CE/PE Supertrend flips GREEN to RED on a closed candle (mark and/or traded price)';
 
+    /** Seconds to wait after a candle closes so its final OHLC is available from Delta. */
+    private const SETTLE = 3;
+
     private int $candleSecs = 900;
     private string $res = '15m';
+    private int $now = 0; // Delta's clock (unix seconds), not this PC's
 
     public function handle(AtmResolver $atm, DeltaClient $delta): int
     {
@@ -39,11 +43,27 @@ class ScanSupertrend extends Command
             default  => ['mark' => 'MARK:', 'traded' => ''],
         };
 
+        // Use Delta's clock, not this PC's: a PC clock running ahead would treat a still-forming
+        // candle as closed and alert early.
+        try {
+            $delta->syncClock();
+        } catch (\Throwable $e) {
+            $this->warn('clock sync failed: ' . $e->getMessage());
+        }
+
+        // The scheduler fires at the top of the minute, exactly when candles close: give the
+        // candle that just closed a few seconds to settle so the alert uses its FINAL close.
+        $into = DeltaClient::serverNow() % 60;
+        if ($into < self::SETTLE) {
+            sleep(self::SETTLE - $into);
+        }
+        $this->now = DeltaClient::serverNow();
+
         // Tracked trades first: an SL must never be blocked by a problem picking the ATM strike.
         $this->checkPositions($delta, $period, $factor);
 
         $pick = $atm->resolve();
-        $this->info("[{$res}] Expiry {$pick['expiry']} | spot {$pick['spot']} | ATM {$pick['atm']} | mode {$pick['mode']} | CE {$pick['ce_strike']} | PE {$pick['pe_strike']} | alert on " . config('supertrend.alert_on', 'red'));
+        $this->info("[{$res}] Expiry {$pick['expiry']} | spot {$pick['spot']} | ATM {$pick['atm']} | mode {$pick['mode']} | CE {$pick['ce_strike']} | PE {$pick['pe_strike']} | alert on " . config('supertrend.alert_on', 'red') . ' | clock skew ' . sprintf('%+d', DeltaClient::skew()) . 's');
 
         $targets = [
             'CE' => [$pick['call'], $pick['ce_strike']],
@@ -85,7 +105,7 @@ class ScanSupertrend extends Command
         $feed = ($p->source === 'mark' ? 'MARK:' : '') . $p->symbol;
 
         $candles = $delta->candles($feed, $p->resolution, 150);
-        if ($candles && end($candles)['time'] + $secs > time()) {
+        if ($candles && end($candles)['time'] + $secs > $this->now - self::SETTLE) {
             array_pop($candles); // still-forming candle
         }
 
@@ -140,7 +160,7 @@ class ScanSupertrend extends Command
         $candles = $delta->candles($feed, $res, 150);
 
         // Drop the still-forming candle: only act on CLOSED candles.
-        if ($candles && end($candles)['time'] + $this->candleSecs > time()) {
+        if ($candles && end($candles)['time'] + $this->candleSecs > $this->now - self::SETTLE) {
             array_pop($candles);
         }
 
@@ -187,7 +207,7 @@ class ScanSupertrend extends Command
 
         // Alert only on a just-closed candle (small grace for scheduler delay). Older flips,
         // e.g. on a strike we just switched to, are history and must not alert.
-        if (time() - $closeTime > (int) config('supertrend.grace_seconds', 180)) {
+        if ($this->now - $closeTime > (int) config('supertrend.grace_seconds', 180)) {
             return;
         }
 
